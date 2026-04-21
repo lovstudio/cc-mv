@@ -32,7 +32,36 @@ It previews the plan and asks for confirmation. Add `--yes` to skip the prompt, 
 | `--no-mv` | Skip the filesystem mv (only migrate CC state — post-move recovery) |
 | `--json` | Machine-readable output (used by the CC skill) |
 | `--projects-dir <dir>` | Override `~/.claude/projects` |
+| `--session <id>` | **Session-level mode**: migrate only this session id (repeatable) |
+| `--grep <pattern>` | **Session-level mode**: migrate sessions whose first user prompt matches the regex (case-insensitive) |
+| `--pick` | **Session-level mode**: interactively pick sessions from a numbered list |
+| `--list-sessions` | Print session summaries for FROM (id, mtime, size, first user prompt) and exit — use with `--json` for scripting |
+| `--delete-source` | Delete migrated source sessions after copy+rewrite (default keeps them as a safety net) |
 | `-h`, `--help` | Show help |
+
+## Session-level migration
+
+By default `cc-mv` migrates **everything** under the FROM slug — including all sub-directory sessions. If you only want specific sessions (e.g. you ran many unrelated chats in one dir and only want to move the ones about topic X to a dedicated project), use session-level mode:
+
+```bash
+# List sessions + first-prompt summaries (read-only — pick ids from this)
+npx -y @lovstudio/cc-mv ~/old --list-sessions
+
+# Migrate specific session ids
+npx -y @lovstudio/cc-mv ~/old ~/new --session abc-def-... --session 123-... --yes
+
+# Regex-match on first user prompt
+npx -y @lovstudio/cc-mv ~/old ~/new --grep 'command vs skill' --yes
+
+# Interactive picker
+npx -y @lovstudio/cc-mv ~/old ~/new --pick
+```
+
+In session-level mode:
+- `fs mv` is **always disabled** (you're moving a subset of sessions, not the whole project folder). Passing `--mv` is an error.
+- Sub-directory slugs are **ignored** (session-level is root-slug-only by design).
+- Source sessions are kept by default; pass `--delete-source` to remove them after migration.
+- `history.jsonl` is **not** rewritten (your prompt up-arrow history for FROM stays at FROM, since the project wasn't actually moved).
 
 ## Examples
 
@@ -45,6 +74,9 @@ npx -y @lovstudio/cc-mv /old /new --no-mv
 
 # Dry-run
 npx -y @lovstudio/cc-mv /a /b --dry-run
+
+# Session-level: migrate one specific chat to a new project, delete source
+npx -y @lovstudio/cc-mv ~/old ~/new --session <uuid> --delete-source --yes
 ```
 
 ## Sub-directory handling

@@ -1,6 +1,6 @@
 {
   "name": "@lovstudio/cc-mv",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Move a project folder AND migrate its Claude Code session history in one shot. Rewrites ~/.claude/projects/<slug>/*.jsonl, history.jsonl, and running-session records so `claude --resume` still works after the move.",
   "keywords": ["claude-code", "cli", "migration", "session", "mv", "move", "rename", "lovstudio"],
   "license": "MIT",

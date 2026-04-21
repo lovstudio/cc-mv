@@ -14,6 +14,11 @@
  *
  * Also invoked as `cc-migrate-session` (alias): that entry point skips the
  * actual fs mv and only migrates CC state — backwards-compatible behavior.
+ *
+ * Session-level granularity:
+ *   --session <id> (repeatable) / --grep <pattern> / --pick
+ *   restrict migration to specific sessions inside FROM's slug dir (root only;
+ *   sub-dirs are ignored in session-level mode). fs mv is disabled in this mode.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -110,6 +115,106 @@ function readFirstCwd(jsonlPath: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Session summary (for listing + picking + grep)
+// ---------------------------------------------------------------------------
+export interface SessionSummary {
+  sessionId: string;      // derived from filename (strip .jsonl)
+  file: string;           // absolute path to the .jsonl
+  slugDir: string;        // absolute path to the slug dir
+  sizeBytes: number;
+  mtime: string;          // ISO
+  firstUserPrompt: string | null; // trimmed, truncated to 300 chars
+  firstTimestamp: string | null;  // ISO of first record
+  messageCount: number;
+}
+
+/**
+ * Extract the first real user prompt (ignore system-reminder wrappers and
+ * command-message/command-name/command-args-only entries as best-effort).
+ * Returns a trimmed, ≤300-char string or null.
+ */
+function extractFirstUserPrompt(jsonlPath: string): string | null {
+  const content = fs.readFileSync(jsonlPath, "utf8");
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { continue; }
+    if (obj.type !== "user") continue;
+    const msg = obj.message;
+    if (!msg) continue;
+    let text: string | null = null;
+    if (typeof msg.content === "string") text = msg.content;
+    else if (Array.isArray(msg.content)) {
+      const parts: string[] = [];
+      for (const c of msg.content) {
+        if (c && typeof c === "object" && c.type === "text" && typeof c.text === "string") parts.push(c.text);
+      }
+      text = parts.join(" ");
+    }
+    if (!text) continue;
+    // strip common CC system-reminder wrappers so the "meat" surfaces
+    text = text
+      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "")
+      .replace(/<command-message>[\s\S]*?<\/command-message>/g, "")
+      .replace(/<command-name>[\s\S]*?<\/command-name>/g, "")
+      .replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>/g, "")
+      .replace(/<command-args>([\s\S]*?)<\/command-args>/g, "$1")
+      .trim();
+    if (!text) continue;
+    if (text.length > 300) text = text.slice(0, 300) + "…";
+    return text;
+  }
+  return null;
+}
+
+function readFirstTimestamp(jsonlPath: string): string | null {
+  const content = fs.readFileSync(jsonlPath, "utf8");
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const obj = JSON.parse(line);
+      if (typeof obj.timestamp === "string") return obj.timestamp;
+    } catch { /* skip */ }
+  }
+  return null;
+}
+
+function countJsonlLines(jsonlPath: string): number {
+  const content = fs.readFileSync(jsonlPath, "utf8");
+  let n = 0;
+  for (const line of content.split("\n")) if (line.trim()) n += 1;
+  return n;
+}
+
+/**
+ * List all sessions in the given slug dir (top-level .jsonl files only).
+ * Sorted by mtime desc.
+ */
+export function listSessions(slugDir: string): SessionSummary[] {
+  if (!fs.existsSync(slugDir)) return [];
+  const out: SessionSummary[] = [];
+  for (const name of fs.readdirSync(slugDir)) {
+    if (!name.endsWith(".jsonl")) continue;
+    const file = path.join(slugDir, name);
+    const st = fs.statSync(file);
+    if (!st.isFile()) continue;
+    const sessionId = name.replace(/\.jsonl$/, "");
+    out.push({
+      sessionId,
+      file,
+      slugDir,
+      sizeBytes: st.size,
+      mtime: st.mtime.toISOString(),
+      firstUserPrompt: extractFirstUserPrompt(file),
+      firstTimestamp: readFirstTimestamp(file),
+      messageCount: countJsonlLines(file),
+    });
+  }
+  out.sort((a, b) => (b.mtime < a.mtime ? -1 : b.mtime > a.mtime ? 1 : 0));
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // jsonl rewrite (generic cwd-style prefix rewrite)
 // ---------------------------------------------------------------------------
 function rewriteJsonlField(content: string, field: string, fromPath: string, toPath: string): { out: string; rewrote: number } {
@@ -163,6 +268,11 @@ function copyDirPreservingTimes(src: string, dst: string): void {
   try { fs.utimesSync(dst, st.atime, st.mtime); } catch { /* best-effort */ }
 }
 
+function rmDirRecursive(p: string): void {
+  if (!fs.existsSync(p)) return;
+  fs.rmSync(p, { recursive: true, force: true });
+}
+
 // ---------------------------------------------------------------------------
 // Real fs mv — prefer rename (instant, preserves everything), fall back to
 // shell `mv` for cross-device (EXDEV). Shell `mv` also preserves metadata
@@ -208,6 +318,9 @@ interface MigrationPair {
   toDir: string;     // projectsDir + toSlug
   sessionCount: number;
   sizeBytes: number;
+  // When non-null, only migrate these specific session ids (filenames without
+  // .jsonl) from this pair's fromDir. null = migrate everything in the dir.
+  sessionFilter: Set<string> | null;
 }
 
 interface MigrateResult {
@@ -217,12 +330,14 @@ interface MigrateResult {
   historyRewrites: number;
   runningSessionRewrites: number;
   firstSessionId: string | null;
+  sourceSessionsDeleted: number;
 }
 
-function migrateSlugs(pairs: MigrationPair[]): { jsonlFilesWritten: number; cwdRewrites: number; firstSessionId: string | null } {
+function migrateSlugs(pairs: MigrationPair[], deleteSource: boolean): { jsonlFilesWritten: number; cwdRewrites: number; firstSessionId: string | null; sourceSessionsDeleted: number } {
   let jsonlFilesWritten = 0;
   let cwdRewrites = 0;
   let firstSessionId: string | null = null;
+  let sourceSessionsDeleted = 0;
 
   for (const pair of pairs) {
     if (!fs.existsSync(pair.fromDir)) continue;
@@ -230,8 +345,24 @@ function migrateSlugs(pairs: MigrationPair[]): { jsonlFilesWritten: number; cwdR
     for (const entry of fs.readdirSync(pair.fromDir, { withFileTypes: true })) {
       const src = path.join(pair.fromDir, entry.name);
       const dst = path.join(pair.toDir, entry.name);
+
+      // session-level filter: restrict to .jsonl files (and their sidecar
+      // dirs, where the name matches a selected session id).
+      if (pair.sessionFilter) {
+        if (entry.isDirectory()) {
+          if (!pair.sessionFilter.has(entry.name)) continue;
+        } else if (entry.isFile()) {
+          if (!entry.name.endsWith(".jsonl")) continue;
+          const sid = entry.name.replace(/\.jsonl$/, "");
+          if (!pair.sessionFilter.has(sid)) continue;
+        } else {
+          continue;
+        }
+      }
+
       if (entry.isDirectory()) {
         copyDirPreservingTimes(src, dst);
+        if (deleteSource) { rmDirRecursive(src); }
         continue;
       }
       if (!entry.isFile()) continue;
@@ -244,12 +375,29 @@ function migrateSlugs(pairs: MigrationPair[]): { jsonlFilesWritten: number; cwdR
         cwdRewrites += rewrote;
         jsonlFilesWritten += 1;
         if (!firstSessionId) firstSessionId = extractSessionId(out);
+        if (deleteSource) {
+          fs.unlinkSync(src);
+          sourceSessionsDeleted += 1;
+        }
       } else {
-        copyFilePreservingTimes(src, dst);
+        // non-session files (if any) — only copy at dir-level granularity.
+        // In session-level mode we never reach here because the filter above
+        // skipped any non-matching files already.
+        if (!pair.sessionFilter) {
+          copyFilePreservingTimes(src, dst);
+          if (deleteSource) fs.unlinkSync(src);
+        }
       }
     }
+    // If we deleted everything and the source slug dir is now empty, clean up.
+    if (deleteSource && fs.existsSync(pair.fromDir)) {
+      try {
+        const remaining = fs.readdirSync(pair.fromDir);
+        if (remaining.length === 0) fs.rmdirSync(pair.fromDir);
+      } catch { /* best-effort */ }
+    }
   }
-  return { jsonlFilesWritten, cwdRewrites, firstSessionId };
+  return { jsonlFilesWritten, cwdRewrites, firstSessionId, sourceSessionsDeleted };
 }
 
 function extractSessionId(jsonlContent: string): string | null {
@@ -287,8 +435,10 @@ function rewriteHistoryJsonl(historyPath: string, pairs: MigrationPair[]): numbe
 // ---------------------------------------------------------------------------
 // Rewrite ~/.claude/sessions/<pid>.json (per-pid running-session records)
 // Field: "cwd" — absolute path. Most of these are stale (pid long gone).
+// In session-level mode, only rewrite records whose sessionId is in the
+// filter set (otherwise we'd affect unrelated sessions).
 // ---------------------------------------------------------------------------
-function rewriteRunningSessions(sessionsDir: string, pairs: MigrationPair[]): number {
+function rewriteRunningSessions(sessionsDir: string, pairs: MigrationPair[], sessionFilter: Set<string> | null): number {
   if (!fs.existsSync(sessionsDir)) return 0;
   let total = 0;
   for (const name of fs.readdirSync(sessionsDir)) {
@@ -301,11 +451,13 @@ function rewriteRunningSessions(sessionsDir: string, pairs: MigrationPair[]): nu
       continue;
     }
     if (typeof obj.cwd !== "string") continue;
+    if (sessionFilter && (typeof obj.sessionId !== "string" || !sessionFilter.has(obj.sessionId))) continue;
+    let changed = false;
     for (const pair of pairs) {
-      if (obj.cwd === pair.from) { obj.cwd = pair.to; total += 1; break; }
-      if (obj.cwd.startsWith(pair.from + "/")) { obj.cwd = pair.to + obj.cwd.slice(pair.from.length); total += 1; break; }
+      if (obj.cwd === pair.from) { obj.cwd = pair.to; total += 1; changed = true; break; }
+      if (obj.cwd.startsWith(pair.from + "/")) { obj.cwd = pair.to + obj.cwd.slice(pair.from.length); total += 1; changed = true; break; }
     }
-    fs.writeFileSync(p, JSON.stringify(obj));
+    if (changed) fs.writeFileSync(p, JSON.stringify(obj));
   }
   return total;
 }
@@ -328,6 +480,7 @@ function buildPairs(from: string, to: string, affected: AffectedSlug[], projects
     fromDir: path.join(projectsDir, fromSlug),
     toDir: path.join(projectsDir, toSlug),
     sessionCount: 0, sizeBytes: 0,
+    sessionFilter: null,
   });
 
   for (const a of affected) {
@@ -350,9 +503,83 @@ function buildPairs(from: string, to: string, affected: AffectedSlug[], projects
       toDir: path.join(projectsDir, pathToSlug(subTo)),
       sessionCount: a.sessionCount,
       sizeBytes: a.sizeBytes,
+      sessionFilter: null,
     });
   }
   return pairs;
+}
+
+// ---------------------------------------------------------------------------
+// Session-level pair construction: only the root pair, restricted to a
+// specific set of session ids. Sub-dir sessions are deliberately ignored —
+// if the user wants sub-dir sessions, they should omit --session/--grep/--pick.
+// ---------------------------------------------------------------------------
+function buildSessionPair(
+  from: string, to: string, projectsDir: string, sessionIds: string[]
+): MigrationPair[] {
+  const fromSlug = pathToSlug(from);
+  const toSlug = pathToSlug(to);
+  const fromDir = path.join(projectsDir, fromSlug);
+  const toDir = path.join(projectsDir, toSlug);
+  let sessionCount = 0;
+  let sizeBytes = 0;
+  if (fs.existsSync(fromDir)) {
+    for (const sid of sessionIds) {
+      const p = path.join(fromDir, sid + ".jsonl");
+      if (fs.existsSync(p)) {
+        sessionCount += 1;
+        sizeBytes += fs.statSync(p).size;
+      }
+    }
+  }
+  return [{
+    from, to, fromSlug, toSlug, fromDir, toDir,
+    sessionCount, sizeBytes,
+    sessionFilter: new Set(sessionIds),
+  }];
+}
+
+// ---------------------------------------------------------------------------
+// Interactive picker (stdin tty): present numbered list, user types indices
+// like "1,3,5-7". Returns selected session ids.
+// ---------------------------------------------------------------------------
+async function pickSessionsInteractive(sessions: SessionSummary[]): Promise<string[]> {
+  if (sessions.length === 0) return [];
+  if (!process.stdin.isTTY) {
+    throw new Error("--pick requires an interactive terminal (stdin is not a TTY)");
+  }
+  console.log("");
+  console.log(`Found ${sessions.length} session(s) — pick which to migrate:`);
+  console.log("");
+  sessions.forEach((s, i) => {
+    const prompt = s.firstUserPrompt ? s.firstUserPrompt.replace(/\s+/g, " ").slice(0, 120) : "(no user prompt found)";
+    console.log(`  [${String(i + 1).padStart(2, " ")}] ${s.sessionId.slice(0, 8)}…  ${formatBytes(s.sizeBytes).padStart(7, " ")}  ${s.mtime.slice(0, 19).replace("T", " ")}`);
+    console.log(`       ${prompt}`);
+  });
+  console.log("");
+  const ans = (await prompt("Select (e.g. '1,3,5-7' or 'all' or empty to abort): ")).trim();
+  if (!ans) return [];
+  if (/^all$/i.test(ans)) return sessions.map(s => s.sessionId);
+  const picked: number[] = [];
+  for (const tok of ans.split(",").map(x => x.trim()).filter(Boolean)) {
+    const m = tok.match(/^(\d+)-(\d+)$/);
+    if (m) {
+      const a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+      for (let i = Math.min(a, b); i <= Math.max(a, b); i++) picked.push(i);
+    } else if (/^\d+$/.test(tok)) {
+      picked.push(parseInt(tok, 10));
+    }
+  }
+  const out: string[] = [];
+  for (const idx of picked) {
+    if (idx >= 1 && idx <= sessions.length) out.push(sessions[idx - 1].sessionId);
+  }
+  return [...new Set(out)];
+}
+
+function filterByGrep(sessions: SessionSummary[], pattern: string): SessionSummary[] {
+  const re = new RegExp(pattern, "i");
+  return sessions.filter(s => s.firstUserPrompt && re.test(s.firstUserPrompt));
 }
 
 // ---------------------------------------------------------------------------
@@ -360,12 +587,18 @@ function buildPairs(from: string, to: string, affected: AffectedSlug[], projects
 // ---------------------------------------------------------------------------
 interface Args {
   from: string;
-  to: string;
+  to: string | null;       // can be null when --list-sessions
   yes: boolean;
   dryRun: boolean;
   projectsDir: string;
   json: boolean;
-  doFsMv: boolean; // cc-mv does it; cc-migrate-session (alias) skips it
+  doFsMv: boolean;
+  explicitMvFlag: boolean; // true if user passed --mv explicitly
+  sessionIds: string[];
+  grep: string | null;
+  pick: boolean;
+  listSessions: boolean;
+  deleteSource: boolean;
 }
 
 function parseArgs(argv: string[], defaultDoFsMv: boolean): Args | { help: true } | { error: string } {
@@ -375,6 +608,12 @@ function parseArgs(argv: string[], defaultDoFsMv: boolean): Args | { help: true 
   let projectsDir = path.join(os.homedir(), ".claude", "projects");
   let json = false;
   let doFsMv = defaultDoFsMv;
+  let explicitMvFlag = false;
+  const sessionIds: string[] = [];
+  let grep: string | null = null;
+  let pick = false;
+  let listSessions = false;
+  let deleteSource = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") return { help: true };
@@ -382,16 +621,33 @@ function parseArgs(argv: string[], defaultDoFsMv: boolean): Args | { help: true 
     else if (a === "--dry-run") dryRun = true;
     else if (a === "--json") json = true;
     else if (a === "--no-mv") doFsMv = false;
-    else if (a === "--mv") doFsMv = true;
+    else if (a === "--mv") { doFsMv = true; explicitMvFlag = true; }
     else if (a === "--projects-dir") projectsDir = argv[++i];
+    else if (a === "--session") { const v = argv[++i]; if (!v) return { error: "--session requires an argument" }; sessionIds.push(v); }
+    else if (a === "--grep") { grep = argv[++i]; if (!grep) return { error: "--grep requires a pattern" }; }
+    else if (a === "--pick") pick = true;
+    else if (a === "--list-sessions") listSessions = true;
+    else if (a === "--delete-source") deleteSource = true;
     else if (a.startsWith("-")) return { error: `Unknown flag: ${a}` };
     else positional.push(a);
   }
+
+  if (listSessions) {
+    if (positional.length < 1 || positional.length > 2) return { error: "With --list-sessions: expected <FROM> [<TO>]" };
+    return {
+      from: normalizeInputPath(positional[0]),
+      to: positional[1] ? normalizeInputPath(positional[1]) : null,
+      yes, dryRun, projectsDir, json, doFsMv, explicitMvFlag,
+      sessionIds, grep, pick, listSessions, deleteSource,
+    };
+  }
+
   if (positional.length !== 2) return { error: "Expected exactly 2 positional args: <FROM> <TO>" };
   return {
     from: normalizeInputPath(positional[0]),
     to: normalizeInputPath(positional[1]),
-    yes, dryRun, projectsDir, json, doFsMv,
+    yes, dryRun, projectsDir, json, doFsMv, explicitMvFlag,
+    sessionIds, grep, pick, listSessions, deleteSource,
   };
 }
 
@@ -401,17 +657,28 @@ function printHelp(binName: string, defaultDoFsMv: boolean): void {
 
 Usage:
   ${binName} <FROM> <TO> [options]
+  ${binName} <FROM> [<TO>] --list-sessions [--json]
 
-What it does:
+What it does (directory-level, default):
   1. mv FROM → TO                          (fs.renameSync, falls back to shell mv)
   2. Rewrites ~/.claude/projects/<slug>/    session store (including sub-dirs)
   3. Rewrites ~/.claude/history.jsonl       (prompt up-arrow history)
   4. Rewrites ~/.claude/sessions/*.json     (running-session records)
 
+Session-level granularity (opt-in):
+  --session <id>         Migrate only this session id (repeatable)
+  --grep <pattern>       Migrate sessions whose first user prompt matches
+                         the regex (case-insensitive)
+  --pick                 Interactively pick sessions from a numbered list
+  --list-sessions        Print session summaries for FROM and exit
+  In session-level mode, fs mv is disabled; sub-dir sessions are ignored.
+
 Options:
   -y, --yes              Execute without interactive confirmation
   --dry-run              Print the plan, do not write
   --no-mv                Skip the filesystem mv; only migrate CC state
+  --delete-source        Delete migrated source sessions after copy+rewrite
+                         (default: keep source as a safety net)
   --projects-dir <dir>   CC projects dir (default: ~/.claude/projects)
   --json                 Machine-readable output (for skill integration)
   -h, --help             Show this help
@@ -420,6 +687,9 @@ Examples:
   ${binName} /Users/mark/old-project /Users/mark/new-project
   ${binName} ~/old ~/new --yes
   ${binName} /a /b --dry-run
+  ${binName} /old /new --session abc-def-... --session 123-... --yes
+  ${binName} /old /new --grep 'command vs skill' --yes
+  ${binName} /old --list-sessions --json
 `);
   } else {
     console.log(`${binName} — migrate Claude Code sessions (CC-state only; does NOT move files on disk)
@@ -430,10 +700,18 @@ Usage:
 This is the backwards-compatible entry point. For a full move + migration,
 use  cc-mv  instead (same syntax, also moves the folder on disk).
 
+Session-level granularity (opt-in):
+  --session <id>         Migrate only this session id (repeatable)
+  --grep <pattern>       Migrate sessions whose first user prompt matches
+                         the regex (case-insensitive)
+  --pick                 Interactively pick sessions from a numbered list
+  --list-sessions        Print session summaries for FROM and exit
+
 Options:
   -y, --yes              Execute without interactive confirmation
   --dry-run              Print the plan, do not write
   --mv                   Also move FROM → TO on disk (equivalent to cc-mv)
+  --delete-source        Delete migrated source sessions after copy+rewrite
   --projects-dir <dir>   CC projects dir (default: ~/.claude/projects)
   --json                 Machine-readable output
   -h, --help             Show this help
@@ -446,26 +724,101 @@ async function main(binName: string, defaultDoFsMv: boolean): Promise<void> {
   if ("help" in parsed) { printHelp(binName, defaultDoFsMv); return; }
   if ("error" in parsed) { console.error(`error: ${parsed.error}\n`); printHelp(binName, defaultDoFsMv); process.exit(2); }
 
-  const { from, to, yes, dryRun, projectsDir, json, doFsMv } = parsed;
+  const {
+    from, to, yes, dryRun, projectsDir, json, doFsMv, explicitMvFlag,
+    sessionIds: cliSessionIds, grep, pick, listSessions: doList, deleteSource,
+  } = parsed;
   const fromSlug = pathToSlug(from);
-  const toSlug = pathToSlug(to);
   const historyPath = path.join(path.dirname(projectsDir), "history.jsonl");
   const sessionsDir = path.join(path.dirname(projectsDir), "sessions");
+  const fromDir = path.join(projectsDir, fromSlug);
 
-  const affected = findAffectedSlugs(projectsDir, fromSlug);
-  const pairs = buildPairs(from, to, affected, projectsDir);
+  // ----- --list-sessions: print summaries for FROM and exit -----
+  if (doList) {
+    const sessions = listSessions(fromDir);
+    if (json) {
+      console.log(JSON.stringify({ phase: "list", from, fromSlug, fromDir, sessions }, null, 2));
+      return;
+    }
+    console.log(`From : ${from}`);
+    console.log(`       slug dir: ${fromDir}`);
+    console.log(`       ${sessions.length} session(s)`);
+    console.log("");
+    sessions.forEach((s, i) => {
+      const p = s.firstUserPrompt ? s.firstUserPrompt.replace(/\s+/g, " ").slice(0, 140) : "(no user prompt found)";
+      console.log(`  [${String(i + 1).padStart(2, " ")}] ${s.sessionId}`);
+      console.log(`       ${formatBytes(s.sizeBytes)}   ${s.mtime.slice(0, 19).replace("T", " ")}   msgs=${s.messageCount}`);
+      console.log(`       ${p}`);
+    });
+    return;
+  }
+
+  // TO must be present for everything below
+  if (!to) { console.error("error: TO is required (only --list-sessions may omit it)"); process.exit(2); }
+
+  // ----- Session-level mode detection -----
+  const sessionLevel = cliSessionIds.length > 0 || grep !== null || pick;
+
+  if (sessionLevel && explicitMvFlag) {
+    console.error("error: session-level migration (--session/--grep/--pick) cannot be combined with --mv");
+    process.exit(2);
+  }
+
+  // Resolve which sessions to migrate (session-level mode)
+  let resolvedSessionIds: string[] = [];
+  if (sessionLevel) {
+    const all = listSessions(fromDir);
+    if (cliSessionIds.length > 0) {
+      const known = new Set(all.map(s => s.sessionId));
+      for (const id of cliSessionIds) {
+        if (!known.has(id)) {
+          console.error(`error: session id not found in ${fromDir}: ${id}`);
+          process.exit(2);
+        }
+      }
+      resolvedSessionIds.push(...cliSessionIds);
+    }
+    if (grep !== null) {
+      let re: RegExp;
+      try { re = new RegExp(grep, "i"); } catch (e: any) { console.error(`error: invalid --grep regex: ${e?.message ?? e}`); process.exit(2); }
+      const hits = all.filter(s => s.firstUserPrompt && re.test(s.firstUserPrompt));
+      resolvedSessionIds.push(...hits.map(s => s.sessionId));
+    }
+    if (pick) {
+      const picked = await pickSessionsInteractive(all);
+      resolvedSessionIds.push(...picked);
+    }
+    resolvedSessionIds = [...new Set(resolvedSessionIds)];
+    if (resolvedSessionIds.length === 0) {
+      if (json) console.log(JSON.stringify({ phase: "plan", from, to, fromSlug, toSlug: pathToSlug(to), sessionLevel: true, resolvedSessionIds: [], pairs: [], totalSessions: 0, totalSize: 0 }, null, 2));
+      else console.log("No sessions matched the filter. Nothing to migrate.");
+      return;
+    }
+  }
+
+  // ----- Build pairs -----
+  const pairs: MigrationPair[] = sessionLevel
+    ? buildSessionPair(from, to, projectsDir, resolvedSessionIds)
+    : buildPairs(from, to, findAffectedSlugs(projectsDir, fromSlug), projectsDir);
+
+  const effectiveDoFsMv = sessionLevel ? false : doFsMv;
+  const toSlug = pathToSlug(to);
   const fromDirExistsOnDisk = fs.existsSync(from);
   const toDirExistsOnDisk = fs.existsSync(to);
 
   const planJson = {
     from, to, fromSlug, toSlug,
-    doFsMv,
+    doFsMv: effectiveDoFsMv,
+    sessionLevel,
+    resolvedSessionIds: sessionLevel ? resolvedSessionIds : null,
+    deleteSource,
     fromDirExistsOnDisk,
     toDirExistsOnDisk,
     pairs: pairs.map(p => ({
       from: p.from, to: p.to, fromSlug: p.fromSlug, toSlug: p.toSlug,
       sessionCount: p.sessionCount, sizeBytes: p.sizeBytes,
       toSlugDirExists: fs.existsSync(p.toDir),
+      sessionFilter: p.sessionFilter ? [...p.sessionFilter] : null,
     })),
     totalSessions: pairs.reduce((a, p) => a + p.sessionCount, 0),
     totalSize: pairs.reduce((a, p) => a + p.sizeBytes, 0),
@@ -482,7 +835,11 @@ async function main(binName: string, defaultDoFsMv: boolean): Promise<void> {
     console.log(`To   : ${to}`);
     console.log(`       slug: ${toSlug}`);
     console.log("");
-    if (doFsMv) {
+    if (sessionLevel) {
+      console.log(`Mode : session-level  (${resolvedSessionIds.length} session(s) selected)`);
+      console.log(`       fs mv disabled; sub-dir sessions ignored.`);
+      console.log(`       source: ${deleteSource ? "will be deleted after migration" : "preserved (safety net)"}`);
+    } else if (effectiveDoFsMv) {
       if (!fromDirExistsOnDisk) {
         console.log(`⚠ FROM does not exist on disk: ${from}`);
         console.log(`  (--no-mv is implied — only CC state will be migrated)`);
@@ -496,7 +853,7 @@ async function main(binName: string, defaultDoFsMv: boolean): Promise<void> {
     if (planJson.totalSessions === 0) {
       console.log(`No CC sessions found for this path or any descendant.`);
       console.log(`(slug dir scanned: ${projectsDir})`);
-      if (!doFsMv || !fromDirExistsOnDisk) return;
+      if (!effectiveDoFsMv || !fromDirExistsOnDisk) return;
       console.log(`Proceeding with fs mv only.`);
     } else {
       console.log(`Affected slug dirs: ${pairs.filter(p => p.sessionCount > 0).length}`);
@@ -506,6 +863,9 @@ async function main(binName: string, defaultDoFsMv: boolean): Promise<void> {
         console.log(`  ${marker} ${p.from}`);
         console.log(`       → ${p.to}`);
         console.log(`       ${p.sessionCount} session(s), ${formatBytes(p.sizeBytes)}${fs.existsSync(p.toDir) ? "  (dest slug exists — will merge)" : ""}`);
+        if (p.sessionFilter) {
+          for (const sid of p.sessionFilter) console.log(`         • ${sid}`);
+        }
       }
     }
     console.log("");
@@ -517,18 +877,22 @@ async function main(binName: string, defaultDoFsMv: boolean): Promise<void> {
   }
 
   if (!yes) {
-    const hasSubDirs = pairs.filter(p => p.sessionCount > 0 && p.from !== from).length;
     let q = `Proceed? [Y/n] `;
-    if (hasSubDirs > 0) {
-      q = `Found ${hasSubDirs} sub-dir(s) with CC sessions. Migrate everything? [Y/n] `;
+    if (sessionLevel) {
+      q = `Migrate ${resolvedSessionIds.length} session(s)${deleteSource ? " (DELETING source after)" : ""}? [Y/n] `;
+    } else {
+      const hasSubDirs = pairs.filter(p => p.sessionCount > 0 && p.from !== from).length;
+      if (hasSubDirs > 0) {
+        q = `Found ${hasSubDirs} sub-dir(s) with CC sessions. Migrate everything? [Y/n] `;
+      }
     }
     const ans = (await prompt(q)).trim();
     if (ans && !/^y(es)?$/i.test(ans)) { console.log("Aborted."); return; }
   }
 
-  // Phase 1 — fs mv (unless disabled or FROM missing)
+  // Phase 1 — fs mv (skipped in session-level mode or when disabled)
   let fsMvMethod: string | null = null;
-  if (doFsMv && fromDirExistsOnDisk) {
+  if (effectiveDoFsMv && fromDirExistsOnDisk) {
     if (toDirExistsOnDisk) {
       throw new Error(`TO already exists on disk: ${to}`);
     }
@@ -538,14 +902,17 @@ async function main(binName: string, defaultDoFsMv: boolean): Promise<void> {
     if (!json) console.log(`✓ mv ${from} → ${to}  (${method})`);
   }
 
-  // Phase 2 — slug store migration (copy-then-rewrite; old slug dir untouched)
-  const slugRes = migrateSlugs(pairs);
+  // Phase 2 — slug store migration (copy-then-rewrite)
+  const slugRes = migrateSlugs(pairs, deleteSource);
 
-  // Phase 3 — history.jsonl
-  const historyRewrites = rewriteHistoryJsonl(historyPath, pairs);
+  // Phase 3 — history.jsonl (only in directory-level mode; session-level
+  // migration doesn't move the whole project so history entries pointing at
+  // FROM should NOT be rewritten — they still belong at FROM.)
+  const historyRewrites = sessionLevel ? 0 : rewriteHistoryJsonl(historyPath, pairs);
 
-  // Phase 4 — running-session records
-  const runningSessionRewrites = rewriteRunningSessions(sessionsDir, pairs);
+  // Phase 4 — running-session records (filter by sessionId in session-level mode)
+  const sessionFilter = sessionLevel ? new Set(resolvedSessionIds) : null;
+  const runningSessionRewrites = rewriteRunningSessions(sessionsDir, pairs, sessionFilter);
 
   const result: MigrateResult = {
     slugsMigrated: pairs.filter(p => p.sessionCount > 0).length,
@@ -554,6 +921,7 @@ async function main(binName: string, defaultDoFsMv: boolean): Promise<void> {
     historyRewrites,
     runningSessionRewrites,
     firstSessionId: slugRes.firstSessionId,
+    sourceSessionsDeleted: slugRes.sourceSessionsDeleted,
   };
 
   if (json) {
@@ -575,9 +943,12 @@ async function main(binName: string, defaultDoFsMv: boolean): Promise<void> {
   console.log(`✓ Rewrote ${result.cwdRewrites} cwd line(s) in sessions`);
   if (historyRewrites > 0) console.log(`✓ Rewrote ${historyRewrites} entry/entries in history.jsonl`);
   if (runningSessionRewrites > 0) console.log(`✓ Rewrote ${runningSessionRewrites} running-session record(s)`);
+  if (result.sourceSessionsDeleted > 0) console.log(`✓ Deleted ${result.sourceSessionsDeleted} source session file(s)`);
   console.log("");
-  console.log(`Old slug dirs are still intact at ${projectsDir}/${fromSlug}* — delete them after verifying --resume works.`);
-  console.log("");
+  if (!sessionLevel) {
+    console.log(`Old slug dirs are still intact at ${projectsDir}/${fromSlug}* — delete them after verifying --resume works.`);
+    console.log("");
+  }
   console.log("Next step — restart Claude Code in the new location:");
   console.log(`  cd ${to}`);
   console.log(`  claude --resume${result.firstSessionId ? `   # or: claude --resume ${result.firstSessionId}` : ""}`);

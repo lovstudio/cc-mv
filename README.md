@@ -122,10 +122,10 @@ Each jsonl line also embeds `"cwd": "<absolute path>"`. Both the dir name **and*
 
 ## Companion CC skill
 
-The `skill/sgc-cc-mv/` dir in this repo is a Claude Code skill. Symlink it:
+The `skill/lov-cc-mv/` dir in this repo is a Claude Code skill. Symlink it:
 
 ```bash
-ln -s $(pwd)/skill/sgc-cc-mv ~/.claude/skills/sgc-cc-mv
+ln -s $(pwd)/skill/lov-cc-mv ~/.claude/skills/lov-cc-mv
 ```
 
 Then when you tell Claude "move this project to /new/path" or "I moved the folder and --resume is gone", CC will auto-invoke this CLI.
